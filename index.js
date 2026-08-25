@@ -1,0 +1,414 @@
+import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import qrcode from 'qrcode-terminal';
+import { GoogleGenAI } from '@google/genai';
+import { getSystemInstruction } from './prompt.js';
+import { testConnection } from './db.js';
+import {
+    obtenerSesion,
+    actualizarSesion,
+    resetearSesion,
+    guardarMensaje,
+    obtenerHistorial,
+    obtenerCabanasDisponibles,
+    calcularCotizacion,
+    formatearCotizacion,
+    crearReserva,
+} from './reservas.js';
+import 'dotenv/config';
+
+const ai = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
+
+// ─────────────────────────────────────────────
+// PROCESAMIENTO DE MENSAJES
+// ─────────────────────────────────────────────
+
+/**
+ * Analiza la respuesta de la IA buscando un bloque JSON de acción.
+ * La IA puede incluir al final de su respuesta un bloque:
+ *   %%ACTION%%{ "accion": "...", ... }%%END%%
+ * Si lo encuentra, lo extrae y devuelve por separado.
+ */
+function extraerAccion(texto) {
+    const regex = /%%ACTION%%(\{[\s\S]*?\})%%END%%/;
+    const match = texto.match(regex);
+    if (!match) return { textoLimpio: texto, accion: null };
+
+    try {
+        const accion = JSON.parse(match[1]);
+        const textoLimpio = texto.replace(regex, '').trim();
+        return { textoLimpio, accion };
+    } catch {
+        return { textoLimpio: texto, accion: null };
+    }
+}
+
+/**
+ * Detecta y extrae imágenes del formato [IMG:url] en el texto de la IA.
+ * Retorna el texto limpio y un array de URLs de imágenes con sus captions.
+ */
+function extraerImagenes(texto) {
+    const regex = /\[IMG:(https?:\/\/[^\]]+)\]/g;
+    const imagenes = [];
+    let match;
+    let textoLimpio = texto;
+
+    while ((match = regex.exec(texto)) !== null) {
+        // Tomar el texto inmediatamente anterior como caption (línea que precede al tag)
+        const antes = texto.slice(0, match.index).trimEnd();
+        const ultimaLinea = antes.split('\n').pop().trim();
+        imagenes.push({ url: match[1], caption: ultimaLinea });
+    }
+
+    // Eliminar los tags [IMG:...] del texto
+    textoLimpio = texto.replace(/\[IMG:(https?:\/\/[^\]]+)\]/g, '').replace(/\n{3,}/g, '\n\n').trim();
+
+    return { textoLimpio, imagenes };
+}
+ 
+function construirContents(historial, mensajeActual) {
+    const contents = historial.map(h => ({
+        role: h.rol === 'assistant' ? 'model' : 'user',
+        parts: [{ text: h.mensaje }],
+    }));
+    contents.push({ role: 'user', parts: [{ text: mensajeActual }] });
+    return contents;
+}
+
+/**
+ * Genera la respuesta del asistente usando el proveedor configurado (Gemini u Ollama local).
+ * Configurado mediante la variable de entorno AI_PROVIDER ('gemini' | 'ollama').
+ */
+async function generarRespuestaIA(historial, mensajeActual) {
+    const provider = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
+    const systemPrompt = getSystemInstruction();
+    const t0 = Date.now();
+
+    if (provider === 'ollama') {
+        const host = process.env.OLLAMA_HOST || 'http://localhost:11434';
+        const model = process.env.OLLAMA_MODEL || 'gemma4:e2b';
+
+        console.log(`⏳ [OLLAMA] Enviando consulta al modelo '${model}' en ${host}...`);
+
+        // Formatear mensajes para la API de Ollama
+        const messages = [
+            { role: 'system', content: systemPrompt },
+            ...historial.map(h => ({
+                role: h.rol === 'assistant' ? 'assistant' : 'user',
+                content: h.mensaje,
+            })),
+            { role: 'user', content: mensajeActual },
+        ];
+
+        try {
+            // Timeout de 60 segundos para evitar que se quede esperando indefinidamente
+            const res = await fetch(`${host}/api/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                signal: AbortSignal.timeout(90000), // 90 segundos para modelos locales
+                body: JSON.stringify({
+                    model,
+                    messages,
+                    stream: false,
+                    options: {
+                        temperature: 0.2,
+                    },
+                }),
+            });
+
+            if (!res.ok) {
+                const errorText = await res.text();
+                throw new Error(`HTTP ${res.status} de Ollama: ${errorText}`);
+            }
+
+            const data = await res.json();
+            const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+            console.log(`✅ [OLLAMA] Respuesta generada exitosamente en ${elapsed}s`);
+
+            return data.message?.content || '';
+        } catch (err) {
+            const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+            console.error(`❌ [OLLAMA ERROR] (${elapsed}s):`, err.message);
+            throw err;
+        }
+
+    } else {
+        // Proveedor: GEMINI
+        if (!ai) {
+            throw new Error('GEMINI_API_KEY no está configurada en el archivo .env');
+        }
+
+        const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+        console.log(`⏳ [GEMINI] Enviando consulta al modelo '${model}'...`);
+
+        const contents = construirContents(historial, mensajeActual);
+
+        try {
+            const response = await ai.models.generateContent({
+                model,
+                config: { systemInstruction: systemPrompt },
+                contents,
+            });
+
+            const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+            console.log(`✅ [GEMINI] Respuesta generada exitosamente en ${elapsed}s`);
+
+            return response.text;
+        } catch (err) {
+            const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+            console.error(`❌ [GEMINI ERROR] (${elapsed}s):`, err.message);
+            throw err;
+        }
+    }
+}
+
+/**
+ * Ejecuta una acción detectada en la respuesta de la IA.
+ * Retorna un mensaje adicional para enviar al cliente, o null.
+ */
+async function ejecutarAccion(accion, jid, sock) {
+    switch (accion.accion) {
+
+        case 'VERIFICAR_DISPONIBILIDAD': {
+            const { check_in, check_out, personas, cabana_id } = accion;
+            if (!check_in || !check_out) return null;
+
+            const disponibles = await obtenerCabanasDisponibles(check_in, check_out);
+            const aptas = disponibles.filter(c => c.capacidad >= parseInt(personas || 1));
+
+            if (aptas.length === 0) {
+                await actualizarSesion(jid, 'inicio');
+                return '😔 Lo siento, no hay disponibilidad para esas fechas con esa cantidad de personas. ¿Quieres intentar con otras fechas?';
+            }
+
+            // Guardar fechas y disponibilidad en la sesión
+            const cabanaElegida = cabana_id
+                ? aptas.find(c => c.id === parseInt(cabana_id)) || aptas[0]
+                : aptas[0];
+
+            await actualizarSesion(jid, 'confirmacion_datos', {
+                check_in,
+                check_out,
+                personas: parseInt(personas || 1),
+                cabana_id: cabanaElegida.id,
+                cabanas_disponibles: aptas.map(c => c.id),
+            });
+
+            const cotizacion = calcularCotizacion(check_in, check_out, cabanaElegida.id);
+            return formatearCotizacion(cotizacion, check_in, check_out, cabanaElegida.id);
+        }
+
+        case 'CREAR_RESERVA': {
+            const { nombre, check_in, check_out, personas, cabana_id, notas } = accion;
+            
+            // Guardamos el identificador (ya sea número normal o LID)
+            const idContacto = jid.split('@')[0];
+            
+            if (!nombre || !check_in || !check_out || !cabana_id) return null;
+
+            try {
+                const reserva = await crearReserva({
+                    jid,
+                    cabanaId:      parseInt(cabana_id),
+                    checkIn:       check_in,
+                    checkOut:      check_out,
+                    nombreHuesped: nombre,
+                    telefono:      idContacto, // Guardamos el ID que nos da WhatsApp
+                    personas:      parseInt(personas || 1),
+                    notas,
+                });
+
+                // 1. NOTIFICACIÓN AL ADMINISTRADOR (CON MENCIÓN CLICKABLE)
+                const adminJid = process.env.ADMIN_WHATSAPP_JID;
+                if (adminJid && sock) {
+                    const cotizacion = reserva.cotizacion;
+                    const msgAdmin =
+                        `🔔 *Nueva solicitud de reserva*\n\n` +
+                        `📋 ID: \`${reserva.id}\`\n` +
+                        `👤 Huésped: ${nombre}\n` +
+                        `📱 Contacto: @${idContacto}\n` + // <-- Mención al usuario
+                        `🏡 Cabaña: ${cabana_id} | 👥 Personas: ${personas}\n` +
+                        `📅 Check-in: ${check_in}\n` +
+                        `📅 Check-out: ${check_out}\n` +
+                        `💰 Total: $${cotizacion.total.toLocaleString('es-CL')}\n` +
+                        `🔒 Abono 20%: $${cotizacion.abono.toLocaleString('es-CL')}\n` +
+                        (notas ? `📝 Notas: ${notas}\n` : '') +
+                        `\n_👉 Toca el contacto en azul (@) arriba para enviarle un mensaje._`;
+
+                    await sock.sendMessage(adminJid, { 
+                        text: msgAdmin,
+                        mentions: [jid] // <-- ¡ESTO ES CLAVE! Hace que el contacto sea un enlace azul para el admin
+                    });
+                }
+
+                // 2. RESPUESTA AL USUARIO MAYOR (CON LINK MÁGICO)
+                // Preparamos un mensaje que ellos le enviarán al administrador sin escribir nada
+                const textoPredefinido = encodeURIComponent(`Hola, soy ${nombre} y mi reserva es la número ${reserva.id}. Quiero coordinar mi abono.`);
+                // Tu número de administrador real
+                const numeroAdminReal = "56951307009";
+                const linkAdmin = `https://wa.me/${numeroAdminReal}?text=${textoPredefinido}`;
+
+                return (
+                    `✅ *¡Solicitud registrada exitosamente, ${nombre}!*\n\n` +
+                    `Tu número de reserva es: \`${reserva.id}\`\n\n` +
+                    `📌 Tu reserva está casi lista. Para que no tengas que escribir números, *simplemente toca el siguiente enlace azul* para avisarle a nuestro administrador y coordinar tu reserva:\n\n` +
+                    `👉 ${linkAdmin} 👈\n\n` +
+                    `🧺 Recuerda traer tus *sábanas personales* el día de tu llegada. ¡Nos vemos pronto! 🌊`
+                );
+            } catch (err) {
+                console.error('Error al crear reserva:', err.message);
+                return '❌ Hubo un problema al registrar tu solicitud. Por favor contacta al administrador al +56951307009.';
+            }
+        }
+        case 'RESETEAR_SESION': {
+            await resetearSesion(jid);
+            return null;
+        }
+
+        default:
+            return null;
+    }
+}
+
+// ─────────────────────────────────────────────
+// VERIFICACIÓN INICIAL DE OLLAMA
+// ─────────────────────────────────────────────
+
+async function verificarOllama() {
+    const host = process.env.OLLAMA_HOST || 'http://localhost:11434';
+    const model = process.env.OLLAMA_MODEL || 'gemma4:e2b';
+
+    try {
+        const res = await fetch(`${host}/api/tags`, { signal: AbortSignal.timeout(5000) });
+        if (!res.ok) {
+            console.warn(`⚠️ [OLLAMA] Servidor respondió con estado HTTP ${res.status}`);
+            return;
+        }
+        const data = await res.json();
+        const modelosDisponibles = (data.models || []).map(m => m.name);
+        const existe = modelosDisponibles.some(m => m === model || m.startsWith(model + ':') || model.startsWith(m));
+
+        if (existe) {
+            console.log(`✅ [OLLAMA] Servidor conectado y modelo '${model}' verificado.`);
+        } else {
+            console.warn(`⚠️ [OLLAMA] El modelo '${model}' NO se encontró en la lista local de Ollama: [${modelosDisponibles.join(', ')}]`);
+        }
+    } catch (err) {
+        console.error(`❌ [OLLAMA] No se pudo conectar a ${host}. ¿Está corriendo el servicio de Ollama? Detalle: ${err.message}`);
+    }
+}
+
+// ─────────────────────────────────────────────
+// BOT PRINCIPAL
+// ─────────────────────────────────────────────
+
+async function startBot() {
+    // Verificar conexión a la base de datos antes de iniciar
+    await testConnection();
+
+    const provider = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
+    const modelName = provider === 'ollama' ? (process.env.OLLAMA_MODEL || 'gemma4:e2b') : (process.env.GEMINI_MODEL || 'gemini-3.6-flash');
+    console.log(`🤖 Proveedor de IA activo: [${provider.toUpperCase()}] usando modelo '${modelName}'`);
+
+    if (provider === 'ollama') {
+        await verificarOllama();
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState('session_auth');
+
+    const sock = makeWASocket({ auth: state });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            qrcode.generate(qr, { small: true });
+        }
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) startBot();
+        } else if (connection === 'open') {
+            console.log('✅ Bot conectado a WhatsApp correctamente');
+        }
+    });
+
+    // Escuchar mensajes entrantes
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+
+        for (const msg of messages) {
+            if (msg.key.fromMe || !msg.message) continue;
+
+            const textMsg = msg.message.conversation || msg.message.extendedTextMessage?.text;
+
+            // Normalizar el JID
+            const rawJid = msg.key.remoteJid || '';
+            let jid = rawJid;
+
+            // Si es un grupo (@g.us) o un ID interno (@lid), el remitente real está en participant
+            if ((rawJid.endsWith('@g.us') || rawJid.endsWith('@lid')) && msg.key.participant) {
+                jid = msg.key.participant;
+            }
+            if (!textMsg) continue;
+
+            const remitente = jid.split('@')[0];
+            console.log(`\n📩 [WhatsApp] Mensaje recibido de ${remitente}: "${textMsg}"`);
+
+            try {
+                // Obtener sesión y historial del cliente
+                const sesion   = await obtenerSesion(jid);
+                const historial = await obtenerHistorial(jid, 20);
+
+                // Guardar mensaje del usuario en el historial
+                await guardarMensaje(jid, 'user', textMsg, sesion.reserva_id || null);
+
+                // Generar respuesta con la IA (Gemini u Ollama según AI_PROVIDER)
+                const respuestaIA = await generarRespuestaIA(historial, textMsg);
+
+                // Extraer acción embebida si la IA la incluyó
+                const { textoLimpio: textoSinAccion, accion } = extraerAccion(respuestaIA);
+
+                // Extraer imágenes embebidas [IMG:url] del texto
+                const { textoLimpio, imagenes } = extraerImagenes(textoSinAccion);
+
+                // Enviar texto principal (si tiene contenido)
+                if (textoLimpio) {
+                    console.log(`📤 [WhatsApp] Enviando respuesta a ${remitente}...`);
+                    await sock.sendMessage(jid, { text: textoLimpio });
+                    await guardarMensaje(jid, 'assistant', textoLimpio, sesion.reserva_id || null);
+                }
+
+                // Enviar imágenes como mensajes de imagen con caption
+                for (const img of imagenes) {
+                    try {
+                        console.log(`🖼️ [WhatsApp] Enviando imagen adjunta: ${img.url}`);
+                        await sock.sendMessage(jid, {
+                            image: { url: img.url },
+                            caption: img.caption || '',
+                        });
+                    } catch (imgErr) {
+                        console.error('Error al enviar imagen:', img.url, imgErr.message);
+                    }
+                }
+
+                // Ejecutar acción si existe (puede generar un mensaje adicional)
+                if (accion) {
+                    console.log(`⚙️ [Acción detectada]: ${accion.accion}`);
+                    const mensajeExtra = await ejecutarAccion(accion, jid, sock);
+                    if (mensajeExtra) {
+                        await sock.sendMessage(jid, { text: mensajeExtra });
+                        await guardarMensaje(jid, 'assistant', mensajeExtra, sesion.reserva_id || null);
+                    }
+                }
+
+            } catch (error) {
+                console.error('❌ Error al procesar mensaje:', error.message);
+                await sock.sendMessage(jid, {
+                    text: 'Lo siento, tuve un problema técnico. Por favor intenta de nuevo o contacta al administrador al +56951307009 🙏',
+                });
+            }
+        }
+    });
+}
+
+startBot();
