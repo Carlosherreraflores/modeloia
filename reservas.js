@@ -1,5 +1,5 @@
 // Módulo de lógica de negocio para gestión de reservas via WhatsApp.
-// Maneja sesiones de conversación, historial, cotización y persistencia en DB MySQL.
+// Maneja sesiones de conversación, historial, cotización y persistencia en DB PostgreSQL.
 
 import { query } from './db.js';
 
@@ -15,12 +15,12 @@ import { query } from './db.js';
 export async function obtenerSesion(jid) {
     await query(
         `INSERT INTO sesiones_bot (whatsapp_jid, etapa, datos_temp)
-         VALUES (?, 'inicio', JSON_OBJECT())
-         ON DUPLICATE KEY UPDATE actualizado_en = NOW()`,
+         VALUES ($1, 'inicio', '{}')
+         ON CONFLICT (whatsapp_jid) DO UPDATE SET actualizado_en = NOW()`,
         [jid]
     );
     const result = await query(
-        `SELECT * FROM sesiones_bot WHERE whatsapp_jid = ?`,
+        `SELECT * FROM sesiones_bot WHERE whatsapp_jid = $1`,
         [jid]
     );
     const sesion = result.rows[0];
@@ -44,18 +44,18 @@ export async function actualizarSesion(jid, etapa, datoTemp = null) {
     if (datoTemp) {
         await query(
             `UPDATE sesiones_bot
-             SET etapa = ?,
-                 datos_temp = JSON_MERGE_PATCH(COALESCE(datos_temp, JSON_OBJECT()), ?),
+             SET etapa = $1,
+                 datos_temp = COALESCE(datos_temp, '{}'::jsonb) || $2::jsonb,
                  actualizado_en = NOW()
-             WHERE whatsapp_jid = ?`,
+             WHERE whatsapp_jid = $3`,
             [etapa, JSON.stringify(datoTemp), jid]
         );
     } else {
         await query(
             `UPDATE sesiones_bot
-             SET etapa = ?,
+             SET etapa = $1,
                  actualizado_en = NOW()
-             WHERE whatsapp_jid = ?`,
+             WHERE whatsapp_jid = $2`,
             [etapa, jid]
         );
     }
@@ -66,8 +66,8 @@ export async function actualizarSesion(jid, etapa, datoTemp = null) {
  */
 export async function vincularReservaASesion(jid, reservaId) {
     await query(
-        `UPDATE sesiones_bot SET reserva_id = ?, actualizado_en = NOW()
-         WHERE whatsapp_jid = ?`,
+        `UPDATE sesiones_bot SET reserva_id = $1, actualizado_en = NOW()
+         WHERE whatsapp_jid = $2`,
         [reservaId, jid]
     );
 }
@@ -78,8 +78,8 @@ export async function vincularReservaASesion(jid, reservaId) {
 export async function resetearSesion(jid) {
     await query(
         `UPDATE sesiones_bot
-         SET etapa = 'inicio', datos_temp = JSON_OBJECT(), reserva_id = NULL, actualizado_en = NOW()
-         WHERE whatsapp_jid = ?`,
+         SET etapa = 'inicio', datos_temp = '{}', reserva_id = NULL, actualizado_en = NOW()
+         WHERE whatsapp_jid = $1`,
         [jid]
     );
 }
@@ -98,7 +98,7 @@ export async function resetearSesion(jid) {
 export async function guardarMensaje(jid, rol, mensaje, reservaId = null) {
     await query(
         `INSERT INTO conversaciones_bot (whatsapp_jid, rol, mensaje, reserva_id)
-         VALUES (?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4)`,
         [jid, rol, mensaje, reservaId]
     );
 }
@@ -112,9 +112,9 @@ export async function guardarMensaje(jid, rol, mensaje, reservaId = null) {
 export async function obtenerHistorial(jid, limite = 20) {
     const result = await query(
         `SELECT rol, mensaje FROM conversaciones_bot
-         WHERE whatsapp_jid = ?
+         WHERE whatsapp_jid = $1
          ORDER BY creado_en DESC
-         LIMIT ?`,
+         LIMIT $2`,
         [jid, Number(limite)]
     );
     // Devolver en orden cronológico (más antiguo primero)
@@ -219,8 +219,8 @@ export async function obtenerCabanasDisponibles(checkIn, checkOut) {
            AND c.id NOT IN (
              SELECT r.cabana_id FROM reservas r
              WHERE r.estado IN ('pendiente', 'confirmada')
-               AND r.check_in  < ?
-               AND r.check_out > ?
+               AND r.check_in  < $1
+               AND r.check_out > $2
            )
          ORDER BY c.id`,
         [checkOut, checkIn]
@@ -263,7 +263,7 @@ export async function crearReserva(datos) {
         `INSERT INTO reservas
            (id, cabana_id, check_in, check_out, nombre_huesped, telefono,
             whatsapp_jid, personas, notas, origen, estado)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'whatsapp', 'pendiente')`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'whatsapp', 'pendiente')`,
         [id, cabanaId, checkIn, checkOut, nombreHuesped, telefono,
          jid, personas, notas || null]
     );
@@ -285,7 +285,7 @@ export async function crearReserva(datos) {
 
     await query(
         `INSERT INTO notificaciones_admin (tipo, reserva_id, whatsapp_jid, mensaje)
-         VALUES ('nueva_reserva', ?, ?, ?)`,
+         VALUES ('nueva_reserva', $1, $2, $3)`,
         [id, jid, mensajeAdmin]
     );
 
@@ -307,7 +307,7 @@ export async function obtenerNotificacionesPendientes() {
     const result = await query(
         `SELECT n.id, n.tipo, n.reserva_id, n.whatsapp_jid, n.mensaje, n.creado_en
          FROM notificaciones_admin n
-         WHERE n.resuelta = FALSE
+         WHERE n.resuelta IS FALSE
          ORDER BY n.creado_en ASC`
     );
     return result.rows;

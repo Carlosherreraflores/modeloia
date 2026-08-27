@@ -64,7 +64,23 @@ function extraerImagenes(texto) {
 
     return { textoLimpio, imagenes };
 }
- 
+
+/**
+ * Detecta si el mensaje es de un tipo no soportado (imagen, video, audio, etc.)
+ * y retorna una descripción amigable del tipo, o null si es texto normal.
+ */
+function detectarTipoMensaje(message) {
+    if (!message) return null;
+    if (message.imageMessage)    return 'imágenes 🖼️';
+    if (message.videoMessage)    return 'videos 🎥';
+    if (message.audioMessage)    return 'audios 🎵';
+    if (message.documentMessage) return 'documentos 📄';
+    if (message.stickerMessage)  return 'stickers';
+    if (message.locationMessage) return 'ubicaciones 📍';
+    if (message.contactMessage)  return 'contactos';
+    return null;
+}
+
 function construirContents(historial, mensajeActual) {
     const contents = historial.map(h => ({
         role: h.rol === 'assistant' ? 'model' : 'user',
@@ -319,6 +335,21 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // Rechazar llamadas entrantes y avisar al usuario que solo se atiende por chat
+    sock.ev.on('call', async (calls) => {
+        for (const call of calls) {
+            if (call.status === 'offer') {
+                console.log(`📵 [Llamada] Rechazando llamada entrante de ${call.from}`);
+                try {
+                    await sock.rejectCall(call.id, call.from);
+                } catch (_) { /* algunos clientes no admiten reject, ignorar */ }
+                await sock.sendMessage(call.from, {
+                    text: '📵 No puedo atender llamadas. Por favor escríbeme tu consulta por *chat* y te respondo enseguida. 😊'
+                });
+            }
+        }
+    });
+
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         if (qr) {
@@ -349,7 +380,17 @@ async function startBot() {
             if ((rawJid.endsWith('@g.us') || rawJid.endsWith('@lid')) && msg.key.participant) {
                 jid = msg.key.participant;
             }
-            if (!textMsg) continue;
+            if (!textMsg) {
+                const tipo = detectarTipoMensaje(msg.message);
+                if (tipo) {
+                    const rawJidReply = msg.key.remoteJid || '';
+                    console.log(`⚠️ [WhatsApp] Mensaje no soportado (${tipo}) de ${rawJidReply.split('@')[0]} — avisando al usuario`);
+                    await sock.sendMessage(rawJidReply, {
+                        text: `⚠️ Solo puedo atender mensajes de *texto*. No proceso ${tipo}.\n\nPor favor escríbeme tu consulta. 😊`
+                    });
+                }
+                continue;
+            }
 
             const remitente = jid.split('@')[0];
             console.log(`\n📩 [WhatsApp] Mensaje recibido de ${remitente}: "${textMsg}"`);
