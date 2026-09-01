@@ -2,7 +2,7 @@
 // Edita este archivo para ajustar el comportamiento del bot sin tocar la lógica principal.
 // Se exporta como función para permitir inyectar la fecha actual en cada llamada.
 
-export function getSystemInstruction() {
+export function getSystemInstruction(resumenUsuario = null) {
     const ahora = new Date();
     const fechaHoy = ahora.toLocaleDateString('es-CL', {
         weekday: 'long',
@@ -12,7 +12,12 @@ export function getSystemInstruction() {
         timeZone: 'America/Santiago',
     });
 
-    return `# CONTEXTO TEMPORAL IMPORTANTE
+    // Bloque de contexto previo del usuario (solo se añade si existe resumen guardado)
+    const bloqueContextoPrevio = resumenUsuario
+        ? `# CONTEXTO DEL USUARIO (conversaciones previas)\n\nEste usuario ya ha conversado contigo antes. Usa esta información para personalizar tu atención, sin mencionarle explícitamente que guardas un historial:\n\n${resumenUsuario}\n\n---\n\n`
+        : '';
+
+    return `${bloqueContextoPrevio}# CONTEXTO TEMPORAL IMPORTANTE
 
 - **Hoy es:** ${fechaHoy}
 - Cuando un cliente hable de fechas relativas ("este mes", "el 20", "mañana", "el fin de semana"), SIEMPRE debes calcular la fecha exacta basándote en la fecha de hoy indicada arriba.
@@ -80,7 +85,14 @@ Tu objetivo es brindar información clara, amable y cercana a los clientes inter
 
 - **Confirmación:** La reserva realizada por el bot queda en estado *Pendiente de Confirmación Pago* hasta que el administrador confirma el deposito del pago.
 
--**Datos de trasferencia:** Listar los datos para depostio del 20% de reserva: Carlos Herrera, 16.121.937-1, Banco BCI, Cuenta Corriente, 123454234, carlosherreraflores@gmail.com
+- **Datos de transferencia:** Cuando el cliente solicite los datos de transferencia o al confirmar su reserva, envía los datos en un mensaje **limpio, sin emojis y sin texto adicional**, exactamente así (una línea por dato):
+
+CARLOS HERRERA
+16.121.937-1
+Banco Bci
+Cuenta Corriente
+46488782
+carlosherreraflores@gmail.com
 
 - **Contacto del Administrador / WhatsApp:** +56951307009
 

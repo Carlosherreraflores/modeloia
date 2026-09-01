@@ -74,6 +74,7 @@ export async function vincularReservaASesion(jid, reservaId) {
 
 /**
  * Reinicia la sesión de un contacto (útil al finalizar un flujo o cancelar).
+ * Conserva el resumen_usuario para que persista entre conversaciones.
  */
 export async function resetearSesion(jid) {
     await query(
@@ -81,6 +82,33 @@ export async function resetearSesion(jid) {
          SET etapa = 'inicio', datos_temp = '{}', reserva_id = NULL, actualizado_en = NOW()
          WHERE whatsapp_jid = $1`,
         [jid]
+    );
+}
+
+/**
+ * Obtiene el resumen de conversaciones previas de un usuario.
+ * @param {string} jid
+ * @returns {string|null} resumen de texto o null si no existe
+ */
+export async function obtenerResumenUsuario(jid) {
+    const result = await query(
+        `SELECT resumen_usuario FROM sesiones_bot WHERE whatsapp_jid = $1`,
+        [jid]
+    );
+    return result.rows[0]?.resumen_usuario || null;
+}
+
+/**
+ * Guarda o actualiza el resumen de conversación de un usuario.
+ * @param {string} jid
+ * @param {string} resumen - texto generado por la IA resumiendo la conversación
+ */
+export async function guardarResumenUsuario(jid, resumen) {
+    await query(
+        `UPDATE sesiones_bot
+         SET resumen_usuario = $1, actualizado_en = NOW()
+         WHERE whatsapp_jid = $2`,
+        [resumen, jid]
     );
 }
 

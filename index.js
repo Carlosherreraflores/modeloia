@@ -9,6 +9,8 @@ import {
     resetearSesion,
     guardarMensaje,
     obtenerHistorial,
+    obtenerResumenUsuario,
+    guardarResumenUsuario,
     obtenerCabanasDisponibles,
     calcularCotizacion,
     formatearCotizacion,
@@ -93,10 +95,13 @@ function construirContents(historial, mensajeActual) {
 /**
  * Genera la respuesta del asistente usando el proveedor configurado (Gemini u Ollama local).
  * Configurado mediante la variable de entorno AI_PROVIDER ('gemini' | 'ollama').
+ * @param {Array} historial - mensajes previos de la sesión actual
+ * @param {string} mensajeActual - mensaje del usuario
+ * @param {string|null} resumenUsuario - resumen de conversaciones anteriores del usuario
  */
-async function generarRespuestaIA(historial, mensajeActual) {
+async function generarRespuestaIA(historial, mensajeActual, resumenUsuario = null) {
     const provider = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
-    const systemPrompt = getSystemInstruction();
+    const systemPrompt = getSystemInstruction(resumenUsuario);
     const t0 = Date.now();
 
     if (provider === 'ollama') {
@@ -174,6 +179,39 @@ async function generarRespuestaIA(historial, mensajeActual) {
             console.error(`❌ [GEMINI ERROR] (${elapsed}s):`, err.message);
             throw err;
         }
+    }
+}
+
+/**
+ * Usa la IA para generar un resumen conciso de la conversación y lo guarda en la BD.
+ * Se llama antes de resetear la sesión para preservar el contexto del usuario.
+ * @param {string} jid
+ */
+async function generarResumenConIA(jid) {
+    try {
+        const historial = await obtenerHistorial(jid, 40);
+        if (historial.length < 3) return; // No vale la pena resumir conversaciones muy cortas
+
+        const conversacionTexto = historial
+            .map(h => `${h.rol === 'user' ? 'Cliente' : 'Bot'}: ${h.mensaje}`)
+            .join('\n');
+
+        const promptResumen =
+            `Analiza la siguiente conversación entre un cliente y el bot de Cabañas Amanda. ` +
+            `Genera un resumen breve (máximo 5 líneas) con los datos clave del cliente que serían útiles ` +
+            `para personalizar futuras conversaciones. Incluye: nombre (si lo mencionó), fechas de interés, ` +
+            `cabaña preferida, cantidad de personas, si tiene mascotas, si hizo reserva y su número, y cualquier ` +
+            `preferencia relevante. Sé conciso y directo, sin saludos ni explicaciones.\n\n` +
+            `CONVERSACIÓN:\n${conversacionTexto}`;
+
+        const resumen = await generarRespuestaIA([], promptResumen);
+        if (resumen && resumen.trim().length > 10) {
+            await guardarResumenUsuario(jid, resumen.trim());
+            console.log(`📝 [Resumen] Resumen guardado para ${jid}`);
+        }
+    } catch (err) {
+        console.error('⚠️ [Resumen] No se pudo generar el resumen:', err.message);
+        // No lanzamos el error: el reset debe continuar aunque falle el resumen
     }
 }
 
@@ -263,19 +301,33 @@ async function ejecutarAccion(accion, jid, sock) {
                 const numeroAdminReal = "56951307009";
                 const linkAdmin = `https://wa.me/${numeroAdminReal}?text=${textoPredefinido}`;
 
-                return (
+                const mensajeConfirmacion =
                     `✅ *¡Solicitud registrada exitosamente, ${nombre}!*\n\n` +
                     `Tu número de reserva es: \`${reserva.id}\`\n\n` +
                     `📌 Tu reserva está casi lista. Para que no tengas que escribir números, *simplemente toca el siguiente enlace azul* para avisarle a nuestro administrador y coordinar tu reserva:\n\n` +
                     `👉 ${linkAdmin} 👈\n\n` +
-                    `🧺 Recuerda traer tus *sábanas personales* el día de tu llegada. ¡Nos vemos pronto! 🌊`
-                );
+                    `🧺 Recuerda traer tus *sábanas personales* el día de tu llegada. ¡Nos vemos pronto! 🌊`;
+
+                // Enviar también los datos de transferencia en mensaje separado y limpio
+                const datosBancarios =
+                    `CARLOS HERRERA\n` +
+                    `16.121.937-1\n` +
+                    `Banco Bci\n` +
+                    `Cuenta Corriente\n` +
+                    `46488782\n` +
+                    `carlosherreraflores@gmail.com`;
+
+                await sock.sendMessage(jid, { text: mensajeConfirmacion });
+                await sock.sendMessage(jid, { text: datosBancarios });
+                return null;
             } catch (err) {
                 console.error('Error al crear reserva:', err.message);
                 return '❌ Hubo un problema al registrar tu solicitud. Por favor contacta al administrador al +56951307009.';
             }
         }
         case 'RESETEAR_SESION': {
+            // Generar y guardar resumen ANTES de limpiar la sesión
+            await generarResumenConIA(jid);
             await resetearSesion(jid);
             return null;
         }
@@ -380,31 +432,25 @@ async function startBot() {
             if ((rawJid.endsWith('@g.us') || rawJid.endsWith('@lid')) && msg.key.participant) {
                 jid = msg.key.participant;
             }
-            if (!textMsg) {
-                const tipo = detectarTipoMensaje(msg.message);
-                if (tipo) {
-                    const rawJidReply = msg.key.remoteJid || '';
-                    console.log(`⚠️ [WhatsApp] Mensaje no soportado (${tipo}) de ${rawJidReply.split('@')[0]} — avisando al usuario`);
-                    await sock.sendMessage(rawJidReply, {
-                        text: `⚠️ Solo puedo atender mensajes de *texto*. No proceso ${tipo}.\n\nPor favor escríbeme tu consulta. 😊`
-                    });
-                }
-                continue;
-            }
 
             const remitente = jid.split('@')[0];
             console.log(`\n📩 [WhatsApp] Mensaje recibido de ${remitente}: "${textMsg}"`);
 
             try {
-                // Obtener sesión y historial del cliente
-                const sesion   = await obtenerSesion(jid);
-                const historial = await obtenerHistorial(jid, 20);
+                // Obtener sesión, historial y resumen de conversaciones previas
+                const sesion         = await obtenerSesion(jid);
+                const historial      = await obtenerHistorial(jid, 20);
+                const resumenUsuario = await obtenerResumenUsuario(jid);
+
+                if (resumenUsuario) {
+                    console.log(`🧠 [Resumen] Contexto previo cargado para ${remitente}`);
+                }
 
                 // Guardar mensaje del usuario en el historial
                 await guardarMensaje(jid, 'user', textMsg, sesion.reserva_id || null);
 
                 // Generar respuesta con la IA (Gemini u Ollama según AI_PROVIDER)
-                const respuestaIA = await generarRespuestaIA(historial, textMsg);
+                const respuestaIA = await generarRespuestaIA(historial, textMsg, resumenUsuario);
 
                 // Extraer acción embebida si la IA la incluyó
                 const { textoLimpio: textoSinAccion, accion } = extraerAccion(respuestaIA);
