@@ -17,6 +17,8 @@ export function getSystemInstruction(resumenUsuario = null) {
         ? `# CONTEXTO DEL USUARIO (conversaciones previas)\n\nEste usuario ya ha conversado contigo antes. Usa esta información para personalizar tu atención, sin mencionarle explícitamente que guardas un historial:\n\n${resumenUsuario}\n\n---\n\n`
         : '';
 
+    const horasExpiracion = process.env.RESERVA_EXPIRACION_HORAS || '2';
+
     return `${bloqueContextoPrevio}# CONTEXTO TEMPORAL IMPORTANTE
 
 - **Hoy es:** ${fechaHoy}
@@ -83,7 +85,7 @@ Tu objetivo es brindar información clara, amable y cercana a los clientes inter
 
 - **Medios de Pago:** Transferencia bancaria, efectivo, o tarjetas (el pago con tarjeta suma un cargo adicional del 3%).
 
-- **Confirmación:** La reserva realizada por el bot queda en estado *Pendiente de Confirmación Pago* hasta que el administrador confirma el deposito del pago.
+- **Confirmación y Tiempo de Retención:** La reserva realizada por el bot queda en estado *Pendiente de Confirmación Pago*. La cabaña queda retenida y protegida durante un plazo de ${horasExpiracion} horas para que el cliente realice la transferencia del 20%. Si no se envía el abono dentro del plazo, la reserva expira y la fecha se libera automáticamente.
 
 - **Datos de transferencia:** Cuando el cliente solicite los datos de transferencia o al confirmar su reserva, envía los datos en un mensaje **limpio, sin emojis y sin texto adicional**, exactamente así (una línea por dato):
 

@@ -39,10 +39,15 @@ CREATE TABLE IF NOT EXISTS reservas (
     personas       INTEGER      NOT NULL DEFAULT 1,
     notas          TEXT,
     origen         VARCHAR(30)  NOT NULL DEFAULT 'whatsapp',
-    estado         VARCHAR(30)  NOT NULL DEFAULT 'pendiente',  -- pendiente | confirmada | cancelada
-    creado_en      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    actualizado_en TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    estado               VARCHAR(30)  NOT NULL DEFAULT 'pendiente',  -- pendiente | confirmada | cancelada | expirada
+    expira_en            TIMESTAMPTZ,                                -- Fecha/hora límite de retención
+    recordatorio_enviado BOOLEAN      NOT NULL DEFAULT FALSE,        -- Si ya se envió el aviso previo
+    creado_en            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    actualizado_en       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_reservas_expiracion
+    ON reservas (estado, expira_en, recordatorio_enviado);
 
 -- ─────────────────────────────────────────────
 -- SESIONES DEL BOT
@@ -84,3 +89,18 @@ CREATE TABLE IF NOT EXISTS notificaciones_admin (
     creado_en    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE sesiones_bot ADD COLUMN IF NOT EXISTS resumen_usuario TEXT;
+
+-- 1. Agregar columnas para control de tiempo de expiración y recordatorio
+ALTER TABLE reservas 
+ADD COLUMN IF NOT EXISTS expira_en TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS recordatorio_enviado BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- 2. Crear índice para optimizar la verificación periódica del bot
+CREATE INDEX IF NOT EXISTS idx_reservas_expiracion 
+ON reservas (estado, expira_en, recordatorio_enviado);
+
+-- 3. (OPCIONAL) Si tienes reservas en estado 'pendiente' antiguas que quieras limpiar o marcar como expiradas:
+UPDATE reservas 
+SET estado = 'expirada' 
+WHERE estado = 'pendiente' AND expira_en IS NULL;

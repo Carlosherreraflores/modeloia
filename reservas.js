@@ -231,13 +231,31 @@ export function formatearCotizacion(cotizacion, checkIn, checkOut, cabanaId) {
     return lineas.join('\n');
 }
 
+// // ─────────────────────────────────────────────
+// UTILIDADES DE FECHA / HORA
+// ─────────────────────────────────────────────
+
+/**
+ * Formatea una fecha/timestamp a hora chilena (HH:mm).
+ */
+export function formatearHoraChile(date) {
+    if (!date) return '';
+    const d = typeof date === 'string' ? new Date(date) : date;
+    return new Intl.DateTimeFormat('es-CL', {
+        timeZone: 'America/Santiago',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+    }).format(d);
+}
+
 // ─────────────────────────────────────────────
 // DISPONIBILIDAD
 // ─────────────────────────────────────────────
 
 /**
  * Retorna qué cabañas están disponibles para el rango de fechas dado.
- * Considera confirmadas y también las pendientes para evitar solapamiento optimista.
+ * Considera confirmadas y también las pendientes cuyo plazo de retención NO haya expirado.
  */
 export async function obtenerCabanasDisponibles(checkIn, checkOut) {
     const result = await query(
@@ -246,7 +264,10 @@ export async function obtenerCabanasDisponibles(checkIn, checkOut) {
          WHERE c.activa = TRUE
            AND c.id NOT IN (
              SELECT r.cabana_id FROM reservas r
-             WHERE r.estado IN ('pendiente', 'confirmada')
+             WHERE (
+                 r.estado = 'confirmada'
+                 OR (r.estado = 'pendiente' AND (r.expira_en IS NULL OR r.expira_en > NOW()))
+             )
                AND r.check_in  < $1
                AND r.check_out > $2
            )
@@ -270,7 +291,7 @@ function generarIdReserva() {
 }
 
 /**
- * Crea una reserva en estado 'pendiente' y dispara una notificación al admin.
+ * Crea una reserva en estado 'pendiente' con tiempo de retención y dispara notificación al admin.
  *
  * @param {object} datos
  * @param {string} datos.jid           - WhatsApp JID del cliente
@@ -287,13 +308,18 @@ export async function crearReserva(datos) {
     const { jid, cabanaId, checkIn, checkOut, nombreHuesped, telefono, personas, notas } = datos;
     const id = generarIdReserva();
 
+    // Calcular expiración según variable de entorno (por defecto 2 horas)
+    const horasExpiracion = parseFloat(process.env.RESERVA_EXPIRACION_HORAS || '2');
+    const expiraEn = new Date(Date.now() + horasExpiracion * 60 * 60 * 1000);
+    const horaLimiteChile = formatearHoraChile(expiraEn);
+
     await query(
         `INSERT INTO reservas
            (id, cabana_id, check_in, check_out, nombre_huesped, telefono,
-            whatsapp_jid, personas, notas, origen, estado)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'whatsapp', 'pendiente')`,
+            whatsapp_jid, personas, notas, origen, estado, expira_en, recordatorio_enviado)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'whatsapp', 'pendiente', $10, FALSE)`,
         [id, cabanaId, checkIn, checkOut, nombreHuesped, telefono,
-         jid, personas, notas || null]
+         jid, personas, notas || null, expiraEn]
     );
 
     // Calcular cotización para incluirla en la notificación al admin
@@ -308,6 +334,7 @@ export async function crearReserva(datos) {
         `Check-in: ${checkIn} | Check-out: ${checkOut}\n` +
         `Noches: ${cotizacion.noches} | Total: $${cotizacion.total.toLocaleString('es-CL')}\n` +
         `Abono esperado (20%): $${cotizacion.abono.toLocaleString('es-CL')}\n` +
+        `⏳ Vence a las: ${horaLimiteChile} hrs (${horasExpiracion}h de retención)\n` +
         (notas ? `Notas: ${notas}\n` : '') +
         `\nPor favor confirma o rechaza esta reserva en el sistema.`;
 
@@ -321,7 +348,73 @@ export async function crearReserva(datos) {
     await actualizarSesion(jid, 'esperando_confirmacion_admin');
     await vincularReservaASesion(jid, id);
 
-    return { id, ...datos, cotizacion };
+    return { id, ...datos, cotizacion, expiraEn, horasExpiracion, horaLimiteChile };
+}
+
+// ─────────────────────────────────────────────
+// GESTIÓN DE EXPIRACIÓN Y RECORDATORIOS
+// ─────────────────────────────────────────────
+
+/**
+ * Obtiene reservas pendientes que están próximas a expirar y no han recibido recordatorio.
+ * @param {number} minutosAntes - Minutos restantes antes de vencer
+ */
+export async function obtenerReservasPorRecordar(minutosAntes = 30) {
+    const result = await query(
+        `SELECT r.id, r.cabana_id, r.check_in, r.check_out, r.nombre_huesped, 
+                r.telefono, r.whatsapp_jid, r.personas, r.expira_en
+         FROM reservas r
+         WHERE r.estado = 'pendiente'
+           AND r.recordatorio_enviado = FALSE
+           AND r.expira_en IS NOT NULL
+           AND r.expira_en > NOW()
+           AND r.expira_en <= NOW() + ($1 || ' minutes')::interval
+         ORDER BY r.expira_en ASC`,
+        [`${minutosAntes}`]
+    );
+    return result.rows;
+}
+
+/**
+ * Marca una reserva indicando que su recordatorio ya fue enviado.
+ */
+export async function marcarRecordatorioEnviado(reservaId) {
+    await query(
+        `UPDATE reservas
+         SET recordatorio_enviado = TRUE,
+             actualizado_en = NOW()
+         WHERE id = $1`,
+        [reservaId]
+    );
+}
+
+/**
+ * Obtiene todas las reservas pendientes cuya fecha de expiración ya se cumplió.
+ */
+export async function obtenerReservasExpiradas() {
+    const result = await query(
+        `SELECT r.id, r.cabana_id, r.check_in, r.check_out, r.nombre_huesped, 
+                r.telefono, r.whatsapp_jid, r.personas, r.expira_en
+         FROM reservas r
+         WHERE r.estado = 'pendiente'
+           AND r.expira_en IS NOT NULL
+           AND r.expira_en <= NOW()
+         ORDER BY r.expira_en ASC`
+    );
+    return result.rows;
+}
+
+/**
+ * Cambia el estado de una reserva a 'expirada'.
+ */
+export async function expirarReserva(reservaId) {
+    await query(
+        `UPDATE reservas
+         SET estado = 'expirada',
+             actualizado_en = NOW()
+         WHERE id = $1 AND estado = 'pendiente'`,
+        [reservaId]
+    );
 }
 
 // ─────────────────────────────────────────────

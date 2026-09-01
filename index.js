@@ -15,6 +15,11 @@ import {
     calcularCotizacion,
     formatearCotizacion,
     crearReserva,
+    formatearHoraChile,
+    obtenerReservasPorRecordar,
+    marcarRecordatorioEnviado,
+    obtenerReservasExpiradas,
+    expirarReserva,
 } from './reservas.js';
 import 'dotenv/config';
 
@@ -285,6 +290,7 @@ async function ejecutarAccion(accion, jid, sock) {
                         `📅 Check-out: ${check_out}\n` +
                         `💰 Total: $${cotizacion.total.toLocaleString('es-CL')}\n` +
                         `🔒 Abono 20%: $${cotizacion.abono.toLocaleString('es-CL')}\n` +
+                        `⏳ Plazo límite: ${reserva.horaLimiteChile} hrs (${reserva.horasExpiracion}h de retención)\n` +
                         (notas ? `📝 Notas: ${notas}\n` : '') +
                         `\n_👉 Toca el contacto en azul (@) arriba para enviarle un mensaje._`;
 
@@ -304,7 +310,8 @@ async function ejecutarAccion(accion, jid, sock) {
                 const mensajeConfirmacion =
                     `✅ *¡Solicitud registrada exitosamente, ${nombre}!*\n\n` +
                     `Tu número de reserva es: \`${reserva.id}\`\n\n` +
-                    `📌 Tu reserva está casi lista. Para que no tengas que escribir números, *simplemente toca el siguiente enlace azul* para avisarle a nuestro administrador y coordinar tu reserva:\n\n` +
+                    `⏳ *Plazo de retención:* Tienes *${reserva.horasExpiracion} hora(s)* (hasta las *${reserva.horaLimiteChile} hrs*) para transferir el 20% del abono y asegurar tu cabaña. Pasado este plazo, las fechas se liberarán automáticamente.\n\n` +
+                    `📌 Para coordinar tu abono fácilmente, *toca el siguiente enlace azul*:\n\n` +
                     `👉 ${linkAdmin} 👈\n\n` +
                     `🧺 Recuerda traer tus *sábanas personales* el día de tu llegada. ¡Nos vemos pronto! 🌊`;
 
@@ -366,6 +373,117 @@ async function verificarOllama() {
 }
 
 // ─────────────────────────────────────────────
+// MONITOR DE EXPIRACIÓN Y RECORDATORIOS
+// ─────────────────────────────────────────────
+
+let monitorIntervalId = null;
+
+function detenerMonitorReservas() {
+    if (monitorIntervalId) {
+        clearInterval(monitorIntervalId);
+        monitorIntervalId = null;
+        console.log('⏹️ [Monitor Reservas] Detenido.');
+    }
+}
+
+function iniciarMonitorReservas(sock) {
+    detenerMonitorReservas();
+
+    const intervaloMinutos = parseFloat(process.env.RESERVA_CHECK_INTERVALO_MINUTOS || '1');
+    const intervaloMs = Math.max(0.5, intervaloMinutos) * 60 * 1000;
+
+    console.log(`⏱️ [Monitor Reservas] Activo (revisión cada ${intervaloMinutos} min)`);
+
+    // Verificación inicial inmediata
+    verificarExpiracionYRecordatorios(sock);
+
+    monitorIntervalId = setInterval(() => {
+        verificarExpiracionYRecordatorios(sock);
+    }, intervaloMs);
+}
+
+async function verificarExpiracionYRecordatorios(sock) {
+    if (!sock) return;
+
+    try {
+        const notificarRecordatorio = process.env.RESERVA_NOTIFICAR_RECORDATORIO !== 'false';
+        const notificarExpiracion   = process.env.RESERVA_NOTIFICAR_EXPIRACION !== 'false';
+        const minutosRecordatorio   = parseInt(process.env.RESERVA_RECORDATORIO_MINUTOS || '30');
+        const adminJid              = process.env.ADMIN_WHATSAPP_JID;
+        const numeroAdminReal       = "56951307009";
+
+        // 1. GESTIÓN DE RECORDATORIOS
+        if (notificarRecordatorio) {
+            const porRecordar = await obtenerReservasPorRecordar(minutosRecordatorio);
+            for (const r of porRecordar) {
+                try {
+                    const horaLimiteChile = formatearHoraChile(r.expira_en);
+                    const textoPredefinido = encodeURIComponent(`Hola, soy ${r.nombre_huesped} y mi reserva es ${r.id}. Quiero coordinar mi abono.`);
+                    const linkAdmin = `https://wa.me/${numeroAdminReal}?text=${textoPredefinido}`;
+
+                    const mensajeRecordatorio =
+                        `⏰ *Recordatorio de Solicitud de Reserva*\n\n` +
+                        `Hola *${r.nombre_huesped}*, te recordamos que tu solicitud de reserva \`${r.id}\` para la *Cabaña ${r.cabana_id}* vencerá pronto (a las *${horaLimiteChile} hrs*).\n\n` +
+                        `Para asegurar tu cabaña y no perder la fecha, por favor realiza el abono del 20% y coordina con nuestro administrador:\n\n` +
+                        `👉 ${linkAdmin} 👈\n\n` +
+                        `_Si ya realizaste la transferencia o necesitas más tiempo, por favor avísanos._`;
+
+                    if (r.whatsapp_jid) {
+                        await sock.sendMessage(r.whatsapp_jid, { text: mensajeRecordatorio });
+                        await guardarMensaje(r.whatsapp_jid, 'assistant', mensajeRecordatorio, r.id);
+                    }
+                    await marcarRecordatorioEnviado(r.id);
+                    console.log(`🔔 [Monitor] Recordatorio enviado a ${r.whatsapp_jid} para reserva ${r.id}`);
+                } catch (errRec) {
+                    console.error(`❌ [Monitor] Error enviando recordatorio para reserva ${r.id}:`, errRec.message);
+                }
+            }
+        }
+
+        // 2. GESTIÓN DE EXPIRACIONES
+        const expiradas = await obtenerReservasExpiradas();
+        for (const r of expiradas) {
+            try {
+                await expirarReserva(r.id);
+                if (r.whatsapp_jid) {
+                    await resetearSesion(r.whatsapp_jid);
+                }
+                console.log(`⏳ [Monitor] Reserva ${r.id} expirada y cabaña ${r.cabana_id} liberada.`);
+
+                // Notificar al cliente si está habilitado
+                if (notificarExpiracion && r.whatsapp_jid) {
+                    const mensajeExpiracion =
+                        `⏳ *Solicitud de Reserva Liberada*\n\n` +
+                        `Hola *${r.nombre_huesped}*, el plazo para confirmar tu solicitud de reserva \`${r.id}\` para la Cabaña ${r.cabana_id} ha finalizado y las fechas han sido liberadas para otros huéspedes.\n\n` +
+                        `Si aún deseas alojarte con nosotros, puedes volver a escribirnos para verificar si las fechas siguen disponibles. ¡Estaremos encantados de recibirte! 🌊`;
+
+                    await sock.sendMessage(r.whatsapp_jid, { text: mensajeExpiracion });
+                    await guardarMensaje(r.whatsapp_jid, 'assistant', mensajeExpiracion, r.id);
+                }
+
+                // Notificar al admin
+                if (adminJid) {
+                    const msgAdminExp =
+                        `⚠️ *Reserva Expirada Automáticamente*\n\n` +
+                        `📋 ID: \`${r.id}\`\n` +
+                        `👤 Huésped: ${r.nombre_huesped}\n` +
+                        `🏡 Cabaña: ${r.cabana_id}\n` +
+                        `📅 Fechas: ${r.check_in} al ${r.check_out}\n\n` +
+                        `_La cabaña ha quedado liberada en el sistema._`;
+
+                    await sock.sendMessage(adminJid, { text: msgAdminExp });
+                }
+            } catch (errExp) {
+                console.error(`❌ [Monitor] Error procesando expiración de reserva ${r.id}:`, errExp.message);
+            }
+        }
+
+    } catch (err) {
+        console.error('❌ [Monitor] Error en ciclo de verificación:', err.message);
+    }
+}
+
+// ─────────────────────────────────────────────
 // BOT PRINCIPAL
 // ─────────────────────────────────────────────
 
@@ -408,10 +526,12 @@ async function startBot() {
             qrcode.generate(qr, { small: true });
         }
         if (connection === 'close') {
+            detenerMonitorReservas();
             const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) startBot();
         } else if (connection === 'open') {
             console.log('✅ Bot conectado a WhatsApp correctamente');
+            iniciarMonitorReservas(sock);
         }
     });
 
