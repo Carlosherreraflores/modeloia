@@ -1,0 +1,86 @@
+services:
+  # ─────────────────────────────────────────────
+  # Base de Datos PostgreSQL 16
+  # ─────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: cabanas_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cabanas_user
+      POSTGRES_PASSWORD: "563o6SaX0Gpk6pNFR.,!"
+      POSTGRES_DB: cabanas_guanaquero
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database_postgres.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cabanas_user -d cabanas_guanaquero"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # Panel Web y API de Reservas (Express)
+  # ─────────────────────────────────────────────
+  reserva:
+    build:
+      context: ../reserva
+      dockerfile: Dockerfile
+    container_name: cabanas_reserva_web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: cabanas_user
+      DB_PASSWORD: "563o6SaX0Gpk6pNFR.,!"
+      DB_NAME: cabanas_guanaquero
+      DB_SSL: "false"
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD_HASH: "$$2a$$10$$RFdZKo9tzsDiRCtUgg3VTeWeE1SWlL/GQn7cPfOrJTD/lIB5jm3PK"
+      JWT_SECRET: "i3kNw1+5*qsYVm6-QGvTgstIl_59pZrd_okxc3"
+      JWT_EXPIRES_IN: "7d"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────
+  # Bot de WhatsApp con IA (Gemini + Baileys)
+  # ─────────────────────────────────────────────
+  bot-whatsapp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cabanas_bot_whatsapp
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: cabanas_user
+      DB_PASSWORD: "563o6SaX0Gpk6pNFR.,!"
+      DB_NAME: cabanas_guanaquero
+      AI_PROVIDER: gemini
+      GEMINI_API_KEY: "AQ.Ab8RN6LEcN49ml-1wIxkkU3TD33eaQ8XuR_EM0WPSPkQwYKkQQ"
+      GEMINI_MODEL: "gemini-3.6-flash"
+      ADMIN_WHATSAPP_JID: "56951307009@s.whatsapp.net"
+      RESERVA_EXPIRACION_HORAS: 24
+      RESERVA_RECORDATORIO_MINUTOS: 60
+      RESERVA_CHECK_INTERVALO_MINUTOS: 120
+      RESERVA_NOTIFICAR_RECORDATORIO: "true"
+      RESERVA_NOTIFICAR_EXPIRACION: "true"
+    volumes:
+      - ./session_auth:/app/session_auth
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    driver: local
+
